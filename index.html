@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Escher</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	</head>
+	<style>
+
+body {
+	margin: 0;
+	background-color: #000;
+	color: #fff;
+	font-family: Monospace;
+	font-size: 13px;
+	line-height: 24px;
+	overscroll-behavior: none;
+}
+
+a {
+	position: absolute;
+	top: 0px;
+	width: 100%;
+	padding: 10px;
+	box-sizing: border-box;
+	text-align: center;
+	z-index: 1
+}
+	</style>
+	<script type="x-shader/x-vertex" id="vertex-shader">
+precision highp float;
+in vec2 position;
+void main() {
+	gl_Position = vec4(position, 0.0, 1.0);
+}
+	</script>
+	<script type="x-shader/x-fragment" id="fragment-shader">
+precision highp float;
+uniform float forward;
+uniform float backward;
+uniform vec2 period;
+uniform vec2 center;
+uniform vec2 translation;
+uniform mat2 M, N;
+uniform float iTime;
+uniform int grad;
+uniform vec4 iResolution;
+uniform sampler2D tDiffuse;
+
+out vec4 gColor;
+
+vec2 logpolar_fwd(in vec2 uv, inout mat2 J) {
+
+	uv -= center;
+
+    // (r,t) = polar coordinates
+    float r = length(uv);	   // grad r = uv/r
+	float t = atan(uv.y,uv.x); // grad t = vec2(-v,u)/(r*r)
+	
+    // log map
+    vec2 uvlog = vec2(log(r),t) / period; 
+	// grad log(r) = grad r / r = uv/(r*r)
+	
+	// J(uvlog) = [grad log(r)/period.x, grad t/period.y]
+	//          = diag(1./(r*r*period)) * [[u v], [-v u]]
+	vec2 scale = 1. / ((r*r)*period);
+	J = mat2(scale*vec2(uv.x, -uv.y), scale*uv.yx)*J;
+	
+	return uvlog;
+}
+
+vec2 logpolar_bwd(in vec2 uvlog, inout mat2 J) {
+	// (r,t) = polar coordinates
+	float t = period.y * uvlog.y;               // in [0, period.y]
+	vec2 dir = vec2(cos(t), sin(t));
+	
+	// exp map, select the best octave
+	vec2 border = 0.5*(sign(dir)+1.); // pos -> 1, neg -> 0
+	vec2 l = log( (border - center)/dir );
+	float margin = min(l.x,l.y)/period.x  - uvlog.x;
+	
+	float minv11 = M[1][0]/(M[0][0]*M[1][1]-M[1][0]*M[0][1]);
+	float nsuboctaves = 1. + abs(minv11);
+	float suboctaves = floor(nsuboctaves*margin);
+	float alpha = mod(suboctaves,nsuboctaves) * sign(minv11)* period.y / nsuboctaves; // CHECK: maybe negate
+	float octave = uvlog.x + suboctaves/nsuboctaves;
+	vec2 scaleddir = exp(octave*period.x) * vec2(cos(alpha), sin(alpha));
+	mat2 scaledrot = mat2(scaleddir.x, -scaleddir.y, scaleddir.y, scaleddir.x);
+	vec2 uv = scaledrot * dir;
+	
+	// J(rt) = [[period.x * r, 0], [0, period.y]]
+	// J(uv) = [[cos(t), sin(t)], r*[-sin(t), cos(t)] = [[u,v]/r, [-v, u]]
+	// J = J(uv)*J(rt) =  [[u,v]/r, [-v, u]] * [[period.x * r, 0], [0, period.y]] = [period.x * uv, period.y * [-v,u]]
+	J = mat2(period.x * uv, period.y*vec2(-uv.y, uv.x)) * J;
+	
+	return uv + center;
+}
+
+void main()
+{
+	vec3 scale = vec3(iResolution.zw/iResolution.xy, 0.);
+
+    // ndc pixel coordinates (from -1 to 1 in smallest dim)
+    vec2 uv = gl_FragCoord.xy * scale.xy - 0.5 * iResolution.zw;	
+    // J(uv) = diag(u',v') = diag(scale)
+	mat2 J = mat2(scale.xz, scale.zy);
+	
+	if (forward!=0.) { uv += center; uv = logpolar_fwd(uv, J); }
+
+	// time varying zoom
+    uv.x += -2.*sin(iTime);
+    // grad unchanged
+	
+	// rotation+scaling in log/polar space
+    uv = N * uv; J = N * J;
+    uv = M * uv; J = M * J;
+	
+	// translation in log/polar space -> scale/rotation in cartesian space
+	uv += translation;
+	// grad unchanged
+	
+	if (backward!=0.) { uv = logpolar_bwd(uv, J); }
+	
+	
+	//gColor = texture(tDiffuse, uv);
+	gColor = textureGrad(tDiffuse, uv, J[0], J[1]);
+	
+	//grad debug
+	switch(grad) {
+	case 0: break;
+	case 1: J[0] = dFdx(uv);
+	case 2: gColor = vec4(fract(0.5+0.5*J[0]*iResolution.xy),0.,1.); break;
+	case 3: J[1] = dFdy(uv);
+	case 4: gColor = vec4(fract(0.5+0.5*J[1]*iResolution.xy),0.,1.); break;
+	}
+}
+	</script>
+
+	<script type="module">
+
+		import * as THREE from './three.module.js';
+
+		let camera, renderer, scene, material, clock;
+		let textures = {};
+		
+		const Midentity = [1  , 0  ,   0  ,1  ];
+		const Mtwist    = [1  ,-1  ,   1  ,1  ];
+		const Muntwist  = [1  , 1  ,  -1  ,1  ];
+		const Muntwist2 = [0.5, 0.5,  -0.5,0.5]; // inverse(Mtwist)
+		
+		let Mindex = 0;
+		const M = [
+				Mtwist, // 1 scale per half turn, original
+				//[2,0, -1,1],
+				//[1,0,  1,1], // t unchanged, 1 scale per octave
+				//[2,0,  1,1], // t unchanged, 1 scale per octave
+				//[1,1,  0,1], // r unchanged, 1 turn per octave
+				Midentity, // rt unchanged, straight
+				Muntwist,  // -1 scale per half turn, twisting the other way
+		]
+		
+		let modes, mode;
+		
+		/*
+			M = [
+				[1,-1,1,1], // exp -> original
+				[1,0,0,1], // exp -> straight
+				[1,1,-1,1],  // exp -> twisting the other way
+				[0.5,0.5,-0.5,0.5], // blow or scan450 -> straight
+				[0,1,-1,0], // double twist
+			];
+			*/
+		function init() {
+
+			renderer = new THREE.WebGLRenderer();
+			renderer.setPixelRatio( window.devicePixelRatio );
+			renderer.setSize( window.innerWidth, window.innerHeight );
+			document.body.appendChild( renderer.domElement );
+
+			const loader = new THREE.TextureLoader();
+
+			textures.scan = loader.load('scan450.jpg');
+			textures.blow1 = loader.load('blow1.jpg');
+			textures.blow2 = loader.load('blow2.jpg');
+			textures.exp = loader.load('exp.jpg');
+			textures.exp2 = loader.load('exp2.jpg');
+			textures.test = loader.load('test.png');
+			for (var tex in textures) {
+				textures[tex].wrapS = THREE.RepeatWrapping;
+				textures[tex].wrapT = THREE.RepeatWrapping;
+			}
+			camera = new THREE.OrthographicCamera();
+			camera.position.z = 1;
+
+			scene = new THREE.Scene();
+
+			const geometry = new THREE.PlaneGeometry(2,2);
+			material = new THREE.RawShaderMaterial({
+				vertexShader: document.querySelector( '#vertex-shader' ).textContent.trim(),
+				fragmentShader: document.querySelector( '#fragment-shader' ).textContent.trim(),
+				uniforms: {
+					tDiffuse: { value: null },
+					forward: { value: 1 },
+					backward: { value: 0 },
+					iResolution: { value: new THREE.Vector4() },
+					iTime: { value: 0 }, 
+					grad: { value: 0 }, 
+					M: { value: [0,0,0,0] },
+					N: { value: [...M[Mindex]] },
+					center: { value:  new THREE.Vector2() },
+					translation: { value:  new THREE.Vector2() },
+					period: { value: [Math.log(256), 2.*Math.PI] }
+				},
+				glslVersion: THREE.GLSL3
+			});
+			const mesh = new THREE.Mesh( geometry, material );
+			scene.add( mesh );
+
+			clock = new THREE.Clock(false);
+			clock.toggle =  function() {
+				if(this.running) { 
+					this.stop();
+				} else {
+					const elapsedTime = this.elapsedTime;
+					this.start();
+					this.elapsedTime = elapsedTime;
+				}
+			};
+			
+			mode = 0;
+			modes = [
+			  { tex: "exp", M: Midentity, backward: 0, center: [0.5, 0.5], translation: [0.057,0.1]},
+			  { tex: "exp2", M: Midentity, backward: 0, center: [0.5, 0.5], translation: [0.057,0.1]},
+			  { tex: "scan", M: Muntwist2, backward: 1, center: [0.5, 0.5], translation: [0.03,0.099]},
+			  { tex: "blow1", M: Muntwist2, backward: 1, center: [0.498, 0.516], translation: [0.016,0.069]},
+			  { tex: "blow2", M: Muntwist2, backward: 1, center: [0.499, 0.517], translation: [0.046,0.079]},
+			  { tex: "test", M: Midentity, backward: 1, center: [0.5, 0.5], translation: [0,0]},
+			];
+			setMode(1);
+			
+			window.addEventListener( 'resize', onWindowResize );
+			window.addEventListener( 'keydown', onKeyDown );
+			onWindowResize();
+		}
+
+		function onWindowResize() {
+			const w = window.innerWidth;
+			const h = window.innerHeight;
+			const aspect = w / h;
+			renderer.setSize( w, h );
+			material.uniforms.iResolution.value.x = w;
+			material.uniforms.iResolution.value.y = h;
+			material.uniforms.iResolution.value.z = aspect > 1 ? aspect : 1;
+			material.uniforms.iResolution.value.w = aspect > 1 ? 1 : 1/aspect;
+		}
+		
+		function setMatrix(i) {
+			Mindex = i % M.length;
+			material.uniforms.N.value = [...M[Mindex]];
+			console.log("matrix", Mindex, material.uniforms.N.value);
+		}
+		
+		function deltaCenter(x, y) {
+			modes[mode].center[0] += x;
+			modes[mode].center[1] += y;
+			material.uniforms.center.value.x =  modes[mode].center[0];
+			material.uniforms.center.value.y =  modes[mode].center[1];
+			console.log("center",  modes[mode].center);
+		}
+
+		function deltaTranslation(x, y) {
+			modes[mode].translation[0] += x;
+			modes[mode].translation[1] += y;
+			material.uniforms.translation.value.x =  modes[mode].translation[0];
+			material.uniforms.translation.value.y =  modes[mode].translation[1];
+			console.log("translation",  modes[mode].translation);
+		}
+
+		function setMode(m) {
+			mode = m % modes.length;
+			material.uniforms.tDiffuse.value = textures[modes[mode].tex];
+			material.uniforms.M.value = [...(modes[mode].M)];
+			material.uniforms.backward.value =  modes[mode].backward;
+			material.uniforms.center.value.x =  modes[mode].center[0];
+			material.uniforms.center.value.y =  modes[mode].center[1];
+			material.uniforms.translation.value.x =  modes[mode].translation[0];
+			material.uniforms.translation.value.y =  modes[mode].translation[1];
+			console.log("texture", modes[mode].tex);
+		}
+		
+		function onKeyDown(e) {
+			if (event.defaultPrevented) return;
+			const speed = 0.001;
+			switch (event.key) {
+				case " " : clock.toggle(); break;
+				case "ArrowUp"    : deltaCenter(0,speed); break;
+				case "ArrowDown"  : deltaCenter(0,-speed); break;
+				case "ArrowLeft"  : deltaCenter(-speed,0); break;
+				case "ArrowRight" : deltaCenter(speed,0); break;
+				case "8"    : deltaTranslation(0,speed); break;
+				case "2"  : deltaTranslation(0,-speed); break;
+				case "4"  : deltaTranslation(-speed,0); break;
+				case "6" : deltaTranslation(speed,0); break;
+				case "Enter" : setMode(mode+1); break;
+				case "w" : setMode(0); break;
+				case "x" : setMode(1); break;
+				case "c" : setMode(2); break;
+				case "v" : setMode(3); break;
+				case "a" : material.uniforms.N.value[0]+=0.01; break;
+				case "z" : material.uniforms.N.value[1]+=0.01; break;
+				case "q" : material.uniforms.N.value[2]+=1; break;
+				case "s" : material.uniforms.N.value[1]*=-1; material.uniforms.N.value[2]*=-1; break;
+				case "e" : material.uniforms.N.value[0]-=0.01; break;
+				case "r" : material.uniforms.N.value[1]-=0.01; break;
+				case "d" : material.uniforms.N.value[2]-=1; break;
+				case "t" : material.uniforms.forward.value = 1- material.uniforms.forward.value; break;
+				case "g" : material.uniforms.grad.value = (material.uniforms.grad.value+1)%5; break;
+				case "m" : setMatrix(Mindex+1); break;
+				default  : return;
+			}
+			event.preventDefault();
+			console.log('matrix', material.uniforms.N.value);
+		}
+		function animate() {
+
+			material.uniforms.iTime.value = clock.getElapsedTime();
+			requestAnimationFrame( animate );
+			renderer.render( scene, camera );
+
+		}
+
+		init();
+		animate();
+
+	</script>
+
+	<body><a href="https://escherdroste.math.leidenuniv.nl/">Source: escherdroste.math.leidenuniv.nl</a>
+	</body>
+</html>
